@@ -2,7 +2,7 @@
 
 ## 🎯 Objetivo
 
-Backend completo y gratuito diseñado específicamente para aplicaciones accesibles, optimizado para tecnologías asistivas como lectores de pantalla, síntesis de voz y dispositivos con capacidades limitadas.
+Backend completo y gratuito diseñado específicamente para aplicaciones accesibles, optimizado para tecnologías asistivas como lectores de pantalla y síntesis de voz.
 
 ## ✨ Características Principales
 
