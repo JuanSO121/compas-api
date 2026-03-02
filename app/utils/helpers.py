@@ -17,16 +17,15 @@ class AccessibleHelpers:
     ) -> Dict[str, Any]:
         """Crear respuesta estructurada accesible"""
         
-        # Determinar tipo de mensaje
+        # ✅ FIX: Determinar tipo de mensaje correctamente.
+        # Antes, success=False sin errors[] retornaba message_type="info",
+        # lo que era semánticamente incorrecto (ej: token inválido devolvía "info").
         if success:
             message_type = "success"
             haptic_pattern = "success"
-        elif errors:
-            message_type = "error" 
-            haptic_pattern = "error"
         else:
-            message_type = "info"
-            haptic_pattern = "info"
+            message_type = "error"
+            haptic_pattern = "error"
         
         # Información de accesibilidad por defecto
         default_accessibility = {
