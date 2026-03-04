@@ -194,6 +194,42 @@ pytest tests/test_auth.py -v
 
 ### Opciones Recomendadas:
 
+#### 0. **Vercel (recomendado para FastAPI serverless)**
+
+Este repositorio ya incluye configuración para Vercel (`vercel.json` + `api/index.py`).
+
+1. En Vercel: **New Project → Import Git Repository**
+2. Selecciona `JuanSO121/compas-api` y rama `main`
+3. Usa estos valores:
+   - **Framework Preset**: `FastAPI`
+   - **Root Directory**: `./`
+   - **Build Command**: `None`
+   - **Output Directory**: `N/A`
+   - **Install Command**: `pip install -r requirements.txt`
+4. En **Environment Variables**, carga todas las variables requeridas por `app/config/settings.py`:
+   - `DATABASE_URL`
+   - `DATABASE_NAME`
+   - `JWT_SECRET_KEY`
+   - `JWT_ALGORITHM`
+   - `JWT_ACCESS_TOKEN_EXPIRE_MINUTES`
+   - `JWT_REFRESH_TOKEN_EXPIRE_DAYS`
+   - `SMTP_HOST`
+   - `SMTP_PORT`
+   - `SMTP_USERNAME`
+   - `SMTP_PASSWORD`
+   - `FROM_EMAIL`
+   - `FROM_NAME`
+   - `ALLOWED_ORIGINS` (formato JSON, por ejemplo: `["https://tu-frontend.vercel.app"]`)
+   - `BCRYPT_ROUNDS`
+   - `MAX_LOGIN_ATTEMPTS`
+   - `LOCKOUT_DURATION_MINUTES`
+   - `REDIS_URL`
+   - `USE_REDIS` (`true` o `false`)
+   - `FRONTEND_URL`
+5. Haz clic en **Deploy**.
+
+> Nota: en Vercel no necesitas ejecutar `uvicorn` manualmente; Vercel levanta la app ASGI desde `api/index.py`.
+
 1. **Render.com** (750 horas gratuitas/mes)
 ```bash
 # Conectar repositorio GitHub a Render
