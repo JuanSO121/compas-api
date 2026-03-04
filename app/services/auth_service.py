@@ -8,6 +8,7 @@ from app.database.collections import users_collection
 from app.models.auth import TokenPair
 import secrets
 import logging
+import bcrypt as _bcrypt
 
 logger = logging.getLogger(__name__)
 
@@ -20,13 +21,22 @@ class AuthService:
     @staticmethod
     def hash_password(password: str) -> str:
         """Hashear contraseña"""
-        return pwd_context.hash(password)
+        salt = _bcrypt.gensalt(rounds=12)
+        hashed = _bcrypt.hashpw(password.encode('utf-8'), salt)
+        return hashed.decode('utf-8')
     
     @staticmethod
     def verify_password(plain_password: str, hashed_password: str) -> bool:
         """Verificar contraseña"""
-        return pwd_context.verify(plain_password, hashed_password)
-    
+        try:
+            return _bcrypt.checkpw(
+                plain_password.encode('utf-8'),
+                hashed_password.encode('utf-8')
+            )
+        except Exception as e:
+            logger.error(f"Error verificando password: {e}")
+            return False
+        
     @staticmethod
     def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
         """Crear token de acceso"""
