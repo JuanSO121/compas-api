@@ -722,3 +722,13 @@ async def verify_code_endpoint(verification_data: dict):
                 "haptic_pattern": "error"
             }
         )
+        
+@router.post("/debug-hash", response_model=dict)
+async def debug_hash(data: dict):
+    test_hash = "$2b$12$DSqcpKApwedQ85S6fYzOEe7Qkmkf4DbBETVRsYx0qAQggsYhoZSIa"
+    password = data.get("password", "")
+    result = auth_service.verify_password(password, test_hash)
+    new_hash = auth_service.hash_password(password)
+    return {"verified": result, "new_hash": new_hash}
+
+
