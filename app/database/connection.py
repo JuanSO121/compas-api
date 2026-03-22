@@ -5,28 +5,32 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class Database:
     client: AsyncIOMotorClient = None
     database = None
 
+
 db = Database()
+
 
 async def connect_to_mongo():
     """Conectar a MongoDB"""
     try:
         db.client = AsyncIOMotorClient(settings.DATABASE_URL)
         db.database = db.client[settings.DATABASE_NAME]
-        
+
         # Verificar conexión
         await db.client.admin.command('ping')
         logger.info("✅ Conectado a MongoDB exitosamente")
-        
+
         # Crear índices
         await create_indexes()
-        
+
     except Exception as e:
         logger.error(f"❌ Error conectando a MongoDB: {e}")
         raise e
+
 
 async def close_mongo_connection():
     """Cerrar conexión a MongoDB"""
@@ -34,18 +38,32 @@ async def close_mongo_connection():
         db.client.close()
         logger.info("🔄 Conexión a MongoDB cerrada")
 
+
 async def create_indexes():
     """Crear índices necesarios"""
     try:
         users_collection = db.database.users
 
+        # Email único (ya existía)
         await users_collection.create_index("email", unique=True)
 
-        # ✅ Verificación por código
+        # ─────────────────────────────────────────────────────────────
+        # NUEVO: Índice único sparse para el código de acceso permanente
+        # sparse=True permite que documentos sin el campo no colisionen
+        # unique=True garantiza que no haya dos usuarios con el mismo código
+        # ─────────────────────────────────────────────────────────────
+        await users_collection.create_index(
+            "security.permanent_access_code",
+            unique=True,
+            sparse=True,
+            name="idx_permanent_access_code"
+        )
+
+        # Índices existentes (verificación legacy)
         await users_collection.create_index("security.email_verification_code")
         await users_collection.create_index("security.email_verification_expires")
 
-        # ✅ Reset de contraseña (sigue usando token)
+        # Reset de contraseña
         await users_collection.create_index("security.password_reset_tokens.token")
 
         await users_collection.create_index("created_at")

@@ -4,7 +4,10 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
 from datetime import datetime, timedelta
 
-from app.models.auth import UserRegistration, UserLogin, PasswordReset, PasswordResetConfirm, TokenPair, TokenRefresh
+from app.models.auth import (
+    UserRegistration, UserLogin, CodeLogin, RequestNewCode,
+    PasswordReset, PasswordResetConfirm, TokenPair, TokenRefresh
+)
 from app.models.user import User
 from app.services.auth_service import auth_service
 from app.services.user_service import user_service
@@ -19,11 +22,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 security = HTTPBearer()
 
+
+# ══════════════════════════════════════════════════════════════════
+# REGISTRO
+# ══════════════════════════════════════════════════════════════════
+
 @router.post("/register", response_model=dict)
 async def register_user(user_data: UserRegistration, request: Request):
-    """Registro de usuario accesible"""
+    """
+    Registro de usuario.
+    Al completarse, se envía un código de acceso PERMANENTE al email.
+    Ese código es la única credencial necesaria para iniciar sesión.
+    """
     try:
-        # Validaciones accesibles
+        # Validar email
         email_validation = AccessibleValidators.validate_email_accessible(user_data.email)
         if not email_validation["valid"]:
             return AccessibleHelpers.create_accessible_response(
@@ -41,6 +53,7 @@ async def register_user(user_data: UserRegistration, request: Request):
                 }
             )
 
+        # Validar contraseña
         password_validation = AccessibleValidators.validate_password_accessible(user_data.password)
         if not password_validation["valid"]:
             return AccessibleHelpers.create_accessible_response(
@@ -53,7 +66,7 @@ async def register_user(user_data: UserRegistration, request: Request):
                 )],
                 accessibility_info={
                     "announcement": f"Error en contraseña: {password_validation['message']}",
-                    "focus_element": "password-field", 
+                    "focus_element": "password-field",
                     "haptic_pattern": "error"
                 }
             )
@@ -67,16 +80,16 @@ async def register_user(user_data: UserRegistration, request: Request):
                 errors=[AccessibleHelpers.create_accessible_error(
                     message="Email ya registrado",
                     field="email",
-                    suggestion="Use un email diferente o inicie sesión si ya tiene cuenta"
+                    suggestion="Use un email diferente o inicie sesión con su código de acceso"
                 )],
                 accessibility_info={
-                    "announcement": "Email ya registrado. ¿Desea iniciar sesión en su lugar?",
+                    "announcement": "Email ya registrado. ¿Desea iniciar sesión con su código?",
                     "focus_element": "email-field",
                     "haptic_pattern": "warning"
                 }
             )
 
-        # Crear usuario
+        # Crear usuario (genera permanent_access_code internamente)
         user_dict = {
             "email": email_validation["normalized_email"],
             "password": user_data.password,
@@ -118,18 +131,26 @@ async def register_user(user_data: UserRegistration, request: Request):
                 }
             )
 
-        # ✅ CAMBIO: Enviar código de verificación
-        verification_code = new_user["security"]["email_verification_code"]["code"]
-        email_sent = await email_service.send_verification_code_email(
+        # ── Enviar email con el código de acceso PERMANENTE ──
+        permanent_code = new_user["security"]["permanent_access_code"]
+        user_name = new_user["profile"].get("first_name", "")
+
+        email_sent = await email_service.send_permanent_access_code_email(
             email=new_user["email"],
-            code=verification_code,
-            user_name=new_user["profile"].get("first_name", ""),
-            expires_minutes=15
+            code=permanent_code,
+            user_name=user_name,
+            is_regenerated=False
         )
 
-        success_message = "Cuenta creada exitosamente. Revise su email para el código de verificación de 6 dígitos."
+        success_message = (
+            "¡Cuenta creada! Revise su email para encontrar su código de acceso permanente. "
+            "Ese código de 6 dígitos es lo único que necesita para ingresar a la aplicación."
+        )
         if not email_sent:
-            success_message += " Nota: No pudimos enviar el email de verificación, pero puede solicitar uno nuevo más tarde."
+            success_message += (
+                " Nota: No pudimos enviar el email. "
+                "Puede solicitar su código desde la pantalla de inicio de sesión."
+            )
 
         return AccessibleHelpers.create_accessible_response(
             success=True,
@@ -137,12 +158,14 @@ async def register_user(user_data: UserRegistration, request: Request):
             data={
                 "user_id": str(new_user["_id"]),
                 "email": new_user["email"],
-                "verification_required": True,
-                "verification_method": "code",  # ✅ NUEVO
+                "next_step": "login_with_code",
                 "email_sent": email_sent
             },
             accessibility_info={
-                "announcement": "Cuenta creada. Revise su email para el código de 6 dígitos.",
+                "announcement": (
+                    "Cuenta creada. Revise su correo electrónico para obtener su código de acceso. "
+                    "Ese código de 6 dígitos es su llave para ingresar a la aplicación."
+                ),
                 "focus_element": "success-message",
                 "haptic_pattern": "success"
             }
@@ -161,12 +184,255 @@ async def register_user(user_data: UserRegistration, request: Request):
                 "haptic_pattern": "error"
             }
         )
-        
-@router.post("/login", response_model=dict)
-async def login_user(login_data: UserLogin, request: Request):
-    """Login de usuario accesible"""
+
+
+# ══════════════════════════════════════════════════════════════════
+# LOGIN CON CÓDIGO PERMANENTE (FLUJO PRINCIPAL)
+# ══════════════════════════════════════════════════════════════════
+
+@router.post("/login-with-code", response_model=dict)
+async def login_with_code(login_data: CodeLogin, request: Request):
+    """
+    Login principal: solo con el código de acceso permanente.
+    No se necesita email ni contraseña.
+
+    - Si es el primer login: verifica la cuenta automáticamente.
+    - Retorna tokens JWT para acceder a la aplicación.
+    """
+    try:
+        # Limpiar código (espacios accidentales)
+        code = login_data.code.strip().replace(" ", "")
+
+        # Validar formato básico
+        if not code.isdigit():
+            return AccessibleHelpers.create_accessible_response(
+                success=False,
+                message="El código solo debe contener números.",
+                errors=[AccessibleHelpers.create_accessible_error(
+                    message="Formato de código incorrecto",
+                    field="code",
+                    suggestion="Ingrese solo los dígitos del código, sin espacios ni letras"
+                )],
+                accessibility_info={
+                    "announcement": "Código incorrecto. Ingrese solo los números del código.",
+                    "focus_element": "code-field",
+                    "haptic_pattern": "error"
+                }
+            )
+
+        # Buscar usuario por código
+        user = await users_collection.find_user_by_access_code(code)
+        if not user:
+            return AccessibleHelpers.create_accessible_response(
+                success=False,
+                message="Código de acceso incorrecto. Verifique el código en su email.",
+                errors=[AccessibleHelpers.create_accessible_error(
+                    message="Código no válido",
+                    field="code",
+                    suggestion="Revise el email que recibió al registrarse. Si perdió su código, use la opción 'Solicitar nuevo código'."
+                )],
+                accessibility_info={
+                    "announcement": (
+                        "Código incorrecto. Revise el email que recibió al registrarse. "
+                        "Si no tiene el código, puede solicitar uno nuevo con su email y contraseña."
+                    ),
+                    "focus_element": "code-field",
+                    "haptic_pattern": "error"
+                }
+            )
+
+        # Verificar cuenta activa
+        if not user.get("is_active", True):
+            return AccessibleHelpers.create_accessible_response(
+                success=False,
+                message="Esta cuenta está desactivada. Contacte al soporte.",
+                accessibility_info={
+                    "announcement": "Cuenta desactivada. Contacte al soporte para más información.",
+                    "focus_element": "error-message",
+                    "haptic_pattern": "error"
+                }
+            )
+
+        # ── Primer login = verificación automática de la cuenta ──
+        first_login = not user.get("is_verified", False)
+        if first_login:
+            await users_collection.update_user(
+                str(user["_id"]),
+                {
+                    "is_verified": True,
+                    "security.email_verified_at": datetime.utcnow(),
+                    "security.permanent_code_first_used_at": datetime.utcnow()
+                }
+            )
+            user["is_verified"] = True
+            logger.info(f"✅ Cuenta verificada en primer login: {user['email']}")
+
+        # Registrar login exitoso (resetear intentos fallidos y guardar fecha)
+        await users_collection.update_login_attempts(user["email"], increment=False)
+
+        # Crear tokens JWT
+        token_pair = auth_service.create_token_pair(user)
+
+        # Datos del usuario a retornar (sin info sensible)
+        name = user.get("profile", {}).get("first_name", "")
+        user_data = {
+            "id": str(user["_id"]),
+            "email": user["email"],
+            "profile": user.get("profile", {}),
+            "accessibility": user.get("accessibility", {}),
+            "first_login": first_login
+        }
+
+        if first_login:
+            welcome = f"¡Bienvenido{f', {name}' if name else ''}! Tu cuenta ha sido verificada exitosamente."
+            announcement = (
+                f"Bienvenido{f' {name}' if name else ''}. "
+                "Tu cuenta ha sido verificada. Ahora puedes usar la aplicación."
+            )
+        else:
+            welcome = f"Bienvenido de vuelta{f', {name}' if name else ''}."
+            announcement = f"Sesión iniciada. Bienvenido de vuelta{f' {name}' if name else ''}."
+
+        return AccessibleHelpers.create_accessible_response(
+            success=True,
+            message=welcome,
+            data={
+                "tokens": token_pair.dict(),
+                "user": user_data
+            },
+            accessibility_info={
+                "announcement": announcement,
+                "focus_element": "main-content",
+                "haptic_pattern": "success"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Error en login con código: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return AccessibleHelpers.create_accessible_response(
+            success=False,
+            message="Error interno durante el inicio de sesión",
+            accessibility_info={
+                "announcement": "Error del servidor. Intente nuevamente en unos momentos.",
+                "focus_element": "error-message",
+                "haptic_pattern": "error"
+            }
+        )
+
+
+# ══════════════════════════════════════════════════════════════════
+# RECUPERACIÓN: SOLICITAR NUEVO CÓDIGO
+# ══════════════════════════════════════════════════════════════════
+
+@router.post("/request-new-code", response_model=dict)
+async def request_new_code(data: RequestNewCode, request: Request):
+    """
+    Solicitar un nuevo código de acceso permanente.
+    Se usa cuando el usuario perdió u olvidó su código.
+    Requiere email + contraseña para verificar la identidad.
+    El nuevo código se envía al email y el anterior deja de funcionar.
+    """
     try:
         # Validar email
+        email_validation = AccessibleValidators.validate_email_accessible(data.email)
+        if not email_validation["valid"]:
+            return AccessibleHelpers.create_accessible_response(
+                success=False,
+                message=email_validation["message"],
+                errors=[AccessibleHelpers.create_accessible_error(
+                    message=email_validation["message"],
+                    field="email",
+                    suggestion="Verifique el formato del email"
+                )],
+                accessibility_info={
+                    "announcement": f"Email inválido: {email_validation['message']}",
+                    "focus_element": "email-field",
+                    "haptic_pattern": "error"
+                }
+            )
+
+        # Autenticar con email + contraseña
+        user = await auth_service.authenticate_user(data.email, data.password)
+        if not user:
+            return AccessibleHelpers.create_accessible_response(
+                success=False,
+                message="Email o contraseña incorrectos.",
+                errors=[AccessibleHelpers.create_accessible_error(
+                    message="Credenciales inválidas",
+                    field="password",
+                    suggestion="Verifique su email y contraseña"
+                )],
+                accessibility_info={
+                    "announcement": "Email o contraseña incorrectos. Verifique sus datos.",
+                    "focus_element": "password-field",
+                    "haptic_pattern": "error"
+                }
+            )
+
+        # Generar y enviar nuevo código permanente
+        from app.services.verification_service import verification_service
+        user_name = user.get("profile", {}).get("first_name", "")
+
+        email_sent = await verification_service.send_new_code_by_email(
+            email=user["email"],
+            user_name=user_name
+        )
+
+        if not email_sent:
+            return AccessibleHelpers.create_accessible_response(
+                success=False,
+                message="Error enviando el nuevo código. Intente nuevamente.",
+                accessibility_info={
+                    "announcement": "Error enviando código. Intente nuevamente en unos momentos.",
+                    "haptic_pattern": "error"
+                }
+            )
+
+        return AccessibleHelpers.create_accessible_response(
+            success=True,
+            message=(
+                "Nuevo código enviado a su email. "
+                "Revise su bandeja de entrada. "
+                "El código anterior ya no funciona."
+            ),
+            accessibility_info={
+                "announcement": (
+                    "Nuevo código de acceso enviado a su correo electrónico. "
+                    "Revise su bandeja de entrada. Recuerde que el código anterior ya no sirve."
+                ),
+                "focus_element": "success-message",
+                "haptic_pattern": "success"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Error solicitando nuevo código: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return AccessibleHelpers.create_accessible_response(
+            success=False,
+            message="Error interno del servidor",
+            accessibility_info={
+                "announcement": "Error del servidor. Intente más tarde.",
+                "haptic_pattern": "error"
+            }
+        )
+
+
+# ══════════════════════════════════════════════════════════════════
+# LOGIN CON EMAIL + CONTRASEÑA (SECUNDARIO / ADMIN)
+# ══════════════════════════════════════════════════════════════════
+
+@router.post("/login", response_model=dict)
+async def login_user(login_data: UserLogin, request: Request):
+    """
+    Login secundario con email y contraseña.
+    Útil para administradores o cuando el usuario no tiene su código.
+    También verifica la cuenta si aún no estaba verificada.
+    """
+    try:
         email_validation = AccessibleValidators.validate_email_accessible(login_data.email)
         if not email_validation["valid"]:
             return AccessibleHelpers.create_accessible_response(
@@ -184,7 +450,6 @@ async def login_user(login_data: UserLogin, request: Request):
                 }
             )
 
-        # Autenticar usuario
         user = await auth_service.authenticate_user(login_data.email, login_data.password)
         if not user:
             return AccessibleHelpers.create_accessible_response(
@@ -193,49 +458,45 @@ async def login_user(login_data: UserLogin, request: Request):
                 errors=[AccessibleHelpers.create_accessible_error(
                     message="Credenciales inválidas",
                     field="password",
-                    suggestion="Verifique su email y contraseña, o use 'Olvidé mi contraseña'"
+                    suggestion="Verifique sus datos o use su código de acceso para iniciar sesión"
                 )],
                 accessibility_info={
-                    "announcement": "Email o contraseña incorrectos. Verifique sus datos.",
-                    "focus_element": "password-field", 
+                    "announcement": "Email o contraseña incorrectos.",
+                    "focus_element": "password-field",
                     "haptic_pattern": "error"
                 }
             )
 
-        # Verificar si la cuenta está verificada
+        # Si la cuenta no está verificada, la verificamos al entrar con contraseña
         if not user.get("is_verified", False):
-            return AccessibleHelpers.create_accessible_response(
-                success=False,
-                message="Debe verificar su email antes de iniciar sesión",
-                data={"requires_verification": True, "email": user["email"]},
-                accessibility_info={
-                    "announcement": "Cuenta no verificada. Revise su email para verificar su cuenta.",
-                    "focus_element": "verification-message",
-                    "haptic_pattern": "warning"
+            await users_collection.update_user(
+                str(user["_id"]),
+                {
+                    "is_verified": True,
+                    "security.email_verified_at": datetime.utcnow()
                 }
             )
+            user["is_verified"] = True
 
-        # Crear tokens
         token_pair = auth_service.create_token_pair(user)
-        
-        # Preparar datos del usuario (sin información sensible)
+        name = user.get("profile", {}).get("first_name", "")
+
         user_data = {
             "id": str(user["_id"]),
             "email": user["email"],
             "profile": user.get("profile", {}),
             "accessibility": user.get("accessibility", {}),
-            "last_login": user.get("security", {}).get("last_login")
         }
 
         return AccessibleHelpers.create_accessible_response(
             success=True,
-            message=f"Bienvenido de vuelta{', ' + user.get('profile', {}).get('first_name', '') if user.get('profile', {}).get('first_name') else ''}",
+            message=f"Bienvenido{f', {name}' if name else ''}",
             data={
                 "tokens": token_pair.dict(),
                 "user": user_data
             },
             accessibility_info={
-                "announcement": f"Sesión iniciada exitosamente. Bienvenido{', ' + user.get('profile', {}).get('first_name', '') if user.get('profile', {}).get('first_name') else ''}.",
+                "announcement": f"Sesión iniciada. Bienvenido{f' {name}' if name else ''}.",
                 "focus_element": "main-content",
                 "haptic_pattern": "success"
             }
@@ -247,30 +508,33 @@ async def login_user(login_data: UserLogin, request: Request):
             success=False,
             message="Error interno durante el inicio de sesión",
             accessibility_info={
-                "announcement": "Error del servidor. Intente nuevamente en unos momentos.",
+                "announcement": "Error del servidor. Intente nuevamente.",
                 "focus_element": "error-message",
                 "haptic_pattern": "error"
             }
         )
 
+
+# ══════════════════════════════════════════════════════════════════
+# RENOVAR TOKEN
+# ══════════════════════════════════════════════════════════════════
+
 @router.post("/refresh", response_model=dict)
 async def refresh_token(refresh_data: TokenRefresh):
     """Renovar token de acceso"""
     try:
-        # Verificar refresh token
         payload = await auth_service.verify_token(refresh_data.refresh_token, "refresh")
         if not payload:
             return AccessibleHelpers.create_accessible_response(
                 success=False,
                 message="Token de renovación inválido o expirado",
                 accessibility_info={
-                    "announcement": "Sesión expirada. Inicie sesión nuevamente.",
-                    "focus_element": "login-form",
+                    "announcement": "Sesión expirada. Ingrese su código de acceso nuevamente.",
+                    "focus_element": "code-field",
                     "haptic_pattern": "warning"
                 }
             )
 
-        # Obtener usuario
         user_id = payload.get("sub")
         user = await users_collection.find_user_by_id(user_id)
         if not user or not user.get("is_active"):
@@ -278,21 +542,20 @@ async def refresh_token(refresh_data: TokenRefresh):
                 success=False,
                 message="Usuario no encontrado o inactivo",
                 accessibility_info={
-                    "announcement": "Usuario no válido. Inicie sesión nuevamente.",
-                    "focus_element": "login-form",
+                    "announcement": "Usuario no válido. Ingrese su código nuevamente.",
+                    "focus_element": "code-field",
                     "haptic_pattern": "error"
                 }
             )
 
-        # Crear nuevo par de tokens
         new_token_pair = auth_service.create_token_pair(user)
 
         return AccessibleHelpers.create_accessible_response(
             success=True,
-            message="Token renovado exitosamente",
+            message="Sesión renovada exitosamente",
             data={"tokens": new_token_pair.dict()},
             accessibility_info={
-                "announcement": "Sesión renovada exitosamente",
+                "announcement": "Sesión renovada",
                 "haptic_pattern": "success"
             }
         )
@@ -303,43 +566,47 @@ async def refresh_token(refresh_data: TokenRefresh):
             success=False,
             message="Error renovando la sesión",
             accessibility_info={
-                "announcement": "Error renovando sesión. Inicie sesión nuevamente.",
-                "focus_element": "login-form",
+                "announcement": "Error renovando sesión. Ingrese su código nuevamente.",
+                "focus_element": "code-field",
                 "haptic_pattern": "error"
             }
         )
 
+
+# ══════════════════════════════════════════════════════════════════
+# LOGOUT
+# ══════════════════════════════════════════════════════════════════
+
 @router.post("/logout", response_model=dict)
 async def logout_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Logout de usuario"""
+    """Cerrar sesión"""
     try:
-        # En un sistema más complejo, aquí se invalidaría el token en una blacklist
         return AccessibleHelpers.create_accessible_response(
             success=True,
             message="Sesión cerrada exitosamente",
             accessibility_info={
                 "announcement": "Sesión cerrada. Hasta pronto.",
-                "focus_element": "login-form",
+                "focus_element": "code-field",
                 "haptic_pattern": "success"
             }
         )
-
     except Exception as e:
         logger.error(f"❌ Error en logout: {e}")
         return AccessibleHelpers.create_accessible_response(
             success=False,
             message="Error cerrando sesión",
-            accessibility_info={
-                "announcement": "Error cerrando sesión",
-                "haptic_pattern": "error"
-            }
+            accessibility_info={"announcement": "Error cerrando sesión", "haptic_pattern": "error"}
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# RESETEO DE CONTRASEÑA (sin cambios)
+# ══════════════════════════════════════════════════════════════════
 
 @router.post("/forgot-password", response_model=dict)
 async def forgot_password(reset_data: PasswordReset):
     """Solicitar reseteo de contraseña"""
     try:
-        # Validar email
         email_validation = AccessibleValidators.validate_email_accessible(reset_data.email)
         if not email_validation["valid"]:
             return AccessibleHelpers.create_accessible_response(
@@ -357,28 +624,19 @@ async def forgot_password(reset_data: PasswordReset):
                 }
             )
 
-        # Buscar usuario
         user = await users_collection.find_user_by_email(reset_data.email)
-        
-        # Por seguridad, siempre responder exitosamente (no revelar si el email existe)
-        success_message = "Si el email existe en nuestro sistema, recibirá instrucciones para resetear su contraseña."
-        
+
         if user and user.get("is_active", False):
-            # Generar token de reseteo
             reset_token = auth_service.generate_verification_token()
             reset_data_dict = {
                 "token": reset_token,
                 "expires": datetime.utcnow() + timedelta(hours=1),
                 "used": False
             }
-            
-            # Actualizar usuario con token de reseteo
             await users_collection.update_user(
                 str(user["_id"]),
                 {"security.password_reset_tokens": [reset_data_dict]}
             )
-            
-            # Enviar email
             await email_service.send_password_reset_email(
                 email=user["email"],
                 token=reset_token,
@@ -387,7 +645,7 @@ async def forgot_password(reset_data: PasswordReset):
 
         return AccessibleHelpers.create_accessible_response(
             success=True,
-            message=success_message,
+            message="Si el email existe en nuestro sistema, recibirá instrucciones para resetear su contraseña.",
             accessibility_info={
                 "announcement": "Revise su email para las instrucciones de reseteo de contraseña.",
                 "focus_element": "success-message",
@@ -407,11 +665,11 @@ async def forgot_password(reset_data: PasswordReset):
             }
         )
 
+
 @router.post("/reset-password", response_model=dict)
 async def reset_password(reset_data: PasswordResetConfirm):
     """Confirmar reseteo de contraseña"""
     try:
-        # Validar nueva contraseña
         password_validation = AccessibleValidators.validate_password_accessible(reset_data.new_password)
         if not password_validation["valid"]:
             return AccessibleHelpers.create_accessible_response(
@@ -429,7 +687,6 @@ async def reset_password(reset_data: PasswordResetConfirm):
                 }
             )
 
-        # Buscar usuario con token válido
         from app.database.connection import get_database
         db = get_database()
         user = await db.users.find_one({
@@ -453,25 +710,23 @@ async def reset_password(reset_data: PasswordResetConfirm):
                 }
             )
 
-        # Actualizar contraseña
         new_password_hash = auth_service.hash_password(reset_data.new_password)
-        
         await users_collection.update_user(
             str(user["_id"]),
             {
                 "password_hash": new_password_hash,
-                "security.password_reset_tokens": [],  # Limpiar tokens
-                "security.failed_login_attempts": 0,   # Resetear intentos fallidos
-                "security.account_locked_until": None  # Desbloquear cuenta
+                "security.password_reset_tokens": [],
+                "security.failed_login_attempts": 0,
+                "security.account_locked_until": None
             }
         )
 
         return AccessibleHelpers.create_accessible_response(
             success=True,
-            message="Contraseña actualizada exitosamente. Ya puede iniciar sesión.",
+            message="Contraseña actualizada. Ya puede usar su código de acceso para iniciar sesión.",
             accessibility_info={
-                "announcement": "Contraseña actualizada exitosamente. Redirigiendo al inicio de sesión.",
-                "focus_element": "login-form",
+                "announcement": "Contraseña actualizada exitosamente.",
+                "focus_element": "code-field",
                 "haptic_pattern": "success"
             }
         )
@@ -488,247 +743,119 @@ async def reset_password(reset_data: PasswordResetConfirm):
             }
         )
 
-@router.post("/verify-email", response_model=dict)
-async def verify_email(token: str):
-    """Verificar email de usuario"""
-    try:
-        # Buscar usuario con token de verificación
-        user = await users_collection.find_user_by_email_verification_token(token)
-        if not user:
-            return AccessibleHelpers.create_accessible_response(
-                success=False,
-                message="Token de verificación inválido o expirado",
-                accessibility_info={
-                    "announcement": "Enlace de verificación inválido. Solicite uno nuevo.",
-                    "focus_element": "error-message",
-                    "haptic_pattern": "error"
-                }
-            )
 
-        # Verificar cuenta
-        await users_collection.update_user(
-            str(user["_id"]),
-            {
-                "is_verified": True,
-                "security.email_verification_token": None
-            }
-        )
+# ══════════════════════════════════════════════════════════════════
+# ENDPOINTS LEGACY (mantenidos por compatibilidad)
+# ══════════════════════════════════════════════════════════════════
 
-        return AccessibleHelpers.create_accessible_response(
-            success=True,
-            message="Email verificado exitosamente. Su cuenta está ahora activa.",
-            accessibility_info={
-                "announcement": "Email verificado exitosamente. Cuenta activada. Redirigiendo al inicio de sesión.",
-                "focus_element": "login-form",
-                "haptic_pattern": "success"
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"❌ Error en verificación de email: {e}")
-        return AccessibleHelpers.create_accessible_response(
-            success=False,
-            message="Error verificando el email",
-            accessibility_info={
-                "announcement": "Error verificando email. Intente nuevamente.",
-                "focus_element": "error-message",
-                "haptic_pattern": "error"
-            }
-        )
-        
 @router.post("/send-verification-code", response_model=dict)
 async def send_verification_code(email_data: dict, request: Request):
-    """Enviar código de verificación por email"""
+    """Enviar código temporal de verificación (legacy)"""
     try:
         from app.services.verification_service import verification_service
-        from app.services.security_service import security_service
-        
+
         email = email_data.get("email")
         if not email:
             return AccessibleHelpers.create_accessible_response(
                 success=False,
                 message="Email requerido",
-                errors=[AccessibleHelpers.create_accessible_error(
-                    message="Debe proporcionar un email",
-                    field="email"
-                )],
-                accessibility_info={
-                    "announcement": "Error: Email requerido",
-                    "focus_element": "email-field",
-                    "haptic_pattern": "error"
-                }
+                accessibility_info={"announcement": "Error: Email requerido", "haptic_pattern": "error"}
             )
-        
-        # Buscar usuario
+
         user = await users_collection.find_user_by_email(email)
         if not user:
             return AccessibleHelpers.create_accessible_response(
                 success=True,
-                message="Si el email existe, recibirá un código de verificación",
-                accessibility_info={
-                    "announcement": "Revise su email para el código de verificación",
-                    "haptic_pattern": "info"
-                }
+                message="Si el email existe, recibirá un código",
+                accessibility_info={"announcement": "Revise su email", "haptic_pattern": "info"}
             )
-        
-        # Si ya está verificado
+
         if user.get("is_verified", False):
             return AccessibleHelpers.create_accessible_response(
                 success=False,
                 message="Esta cuenta ya está verificada",
-                accessibility_info={
-                    "announcement": "Cuenta ya verificada. Puede iniciar sesión.",
-                    "haptic_pattern": "info"
-                }
+                accessibility_info={"announcement": "Cuenta ya verificada.", "haptic_pattern": "info"}
             )
-        
-        # Enviar código
+
         user_name = user.get("profile", {}).get("first_name", "")
         email_sent = await verification_service.send_verification_code(email, user_name)
-        
+
         if email_sent:
             return AccessibleHelpers.create_accessible_response(
                 success=True,
-                message="Código de verificación enviado. Revise su email.",
-                data={
-                    "expires_in_minutes": verification_service.CODE_EXPIRATION_MINUTES,
-                    "max_attempts": verification_service.MAX_ATTEMPTS
-                },
-                accessibility_info={
-                    "announcement": f"Código enviado. Tiene {verification_service.CODE_EXPIRATION_MINUTES} minutos para ingresarlo.",
-                    "haptic_pattern": "success"
-                }
+                message="Código temporal enviado.",
+                accessibility_info={"announcement": "Código enviado.", "haptic_pattern": "success"}
             )
         else:
             return AccessibleHelpers.create_accessible_response(
                 success=False,
-                message="Error enviando el código. Intente nuevamente.",
-                accessibility_info={
-                    "announcement": "Error enviando código. Intente nuevamente.",
-                    "haptic_pattern": "error"
-                }
+                message="Error enviando el código.",
+                accessibility_info={"announcement": "Error enviando código.", "haptic_pattern": "error"}
             )
-            
+
     except Exception as e:
-        logger.error(f"❌ Error enviando código: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"❌ Error enviando código legacy: {e}")
         return AccessibleHelpers.create_accessible_response(
             success=False,
             message="Error interno del servidor",
-            accessibility_info={
-                "announcement": "Error del servidor. Intente más tarde.",
-                "haptic_pattern": "error"
-            }
+            accessibility_info={"announcement": "Error del servidor.", "haptic_pattern": "error"}
         )
 
 
 @router.post("/verify-code", response_model=dict)
 async def verify_code_endpoint(verification_data: dict):
-    """Verificar código de verificación"""
+    """Verificar código temporal (legacy)"""
     try:
         from app.services.verification_service import verification_service
-        
+
         email = verification_data.get("email")
         code = verification_data.get("code")
-        
+
         if not email or not code:
             return AccessibleHelpers.create_accessible_response(
                 success=False,
                 message="Email y código son requeridos",
-                errors=[AccessibleHelpers.create_accessible_error(
-                    message="Faltan datos requeridos",
-                    field="email" if not email else "code"
-                )],
-                accessibility_info={
-                    "announcement": "Error: Falta información requerida",
-                    "focus_element": "email-field" if not email else "code-field",
-                    "haptic_pattern": "error"
-                }
+                accessibility_info={"announcement": "Faltan datos requeridos", "haptic_pattern": "error"}
             )
-        
-        # Limpiar y validar código
+
         code = code.strip().replace(" ", "")
         if not code.isdigit() or len(code) != 6:
             return AccessibleHelpers.create_accessible_response(
                 success=False,
                 message="Código inválido. Debe ser de 6 dígitos.",
-                errors=[AccessibleHelpers.create_accessible_error(
-                    message="Formato de código inválido",
-                    field="code",
-                    suggestion="Ingrese los 6 dígitos del código"
-                )],
-                accessibility_info={
-                    "announcement": "Código inválido. Ingrese 6 dígitos.",
-                    "focus_element": "code-field",
-                    "haptic_pattern": "error"
-                }
+                accessibility_info={"announcement": "Código inválido.", "haptic_pattern": "error"}
             )
-        
-        # Verificar código
+
         result = await verification_service.verify_code(email, code)
-        
+
         if result["success"]:
             return AccessibleHelpers.create_accessible_response(
                 success=True,
-                message="¡Email verificado exitosamente! Ya puede iniciar sesión.",
+                message="Email verificado exitosamente.",
                 data={"verified": True},
-                accessibility_info={
-                    "announcement": "Email verificado exitosamente. Redirigiendo al inicio de sesión.",
-                    "haptic_pattern": "success"
-                }
+                accessibility_info={"announcement": "Email verificado.", "haptic_pattern": "success"}
             )
         else:
-            error_messages = {
-                "user_not_found": "Usuario no encontrado",
-                "no_code": "No hay código activo. Solicite uno nuevo.",
-                "expired": "Código expirado. Solicite uno nuevo.",
-                "max_attempts": "Demasiados intentos. Solicite un nuevo código.",
-                "invalid_code": result.get("message", "Código incorrecto"),
-                "server_error": "Error del servidor. Intente nuevamente."
-            }
-            
-            error_type = result.get("error_type", "server_error")
-            message = error_messages.get(error_type, result.get("message"))
-            
             return AccessibleHelpers.create_accessible_response(
                 success=False,
-                message=message,
-                data={
-                    "error_type": error_type,
-                    "remaining_attempts": result.get("remaining_attempts")
-                },
-                errors=[AccessibleHelpers.create_accessible_error(
-                    message=message,
-                    field="code",
-                    suggestion="Verifique el código e intente nuevamente" if error_type == "invalid_code" else "Solicite un nuevo código"
-                )],
-                accessibility_info={
-                    "announcement": message,
-                    "focus_element": "code-field" if error_type == "invalid_code" else "resend-button",
-                    "haptic_pattern": "error"
-                }
+                message=result.get("message", "Código incorrecto"),
+                accessibility_info={"announcement": result.get("message", "Código incorrecto"), "haptic_pattern": "error"}
             )
-            
+
     except Exception as e:
-        logger.error(f"❌ Error verificando código: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"❌ Error verificando código legacy: {e}")
         return AccessibleHelpers.create_accessible_response(
             success=False,
             message="Error interno verificando el código",
-            accessibility_info={
-                "announcement": "Error del servidor. Intente nuevamente.",
-                "haptic_pattern": "error"
-            }
+            accessibility_info={"announcement": "Error del servidor.", "haptic_pattern": "error"}
         )
-        
+
+
 @router.post("/debug-hash", response_model=dict)
 async def debug_hash(data: dict):
+    """Debug de hash (solo desarrollo)"""
     test_hash = "$2b$12$DSqcpKApwedQ85S6fYzOEe7Qkmkf4DbBETVRsYx0qAQggsYhoZSIa"
     password = data.get("password", "")
     result = auth_service.verify_password(password, test_hash)
     new_hash = auth_service.hash_password(password)
     return {"verified": result, "new_hash": new_hash}
-
-

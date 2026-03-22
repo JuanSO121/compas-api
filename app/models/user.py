@@ -80,39 +80,45 @@ class UserSecurity(BaseModel):
     failed_login_attempts: int = Field(default=0)
     account_locked_until: Optional[datetime] = None
 
-    # Password reset (tokens siguen siendo válidos)
-    password_reset_tokens: List[Dict[str, Any]] = Field(default_factory=list)
-
-    # ✅ VERIFICACIÓN POR CÓDIGO (EMAIL) - CAMBIO PRINCIPAL
-    email_verification_code: Optional[str] = Field(
+    # ─────────────────────────────────────────────────
+    # CÓDIGO DE ACCESO PERMANENTE (LOGIN PRINCIPAL)
+    # ─────────────────────────────────────────────────
+    # Este código se genera al registrarse y se envía al correo.
+    # Es la única credencial necesaria para iniciar sesión.
+    # Se puede regenerar usando email + contraseña (recuperación).
+    permanent_access_code: Optional[str] = Field(
         default=None,
         min_length=6,
-        max_length=6,
-        description="Código numérico de verificación de email"
+        max_length=8,
+        description="Código permanente de acceso para login sin contraseña"
     )
-    email_verification_expires: Optional[datetime] = Field(
+    # Fecha en que se usó el código por primera vez (= verificación de cuenta)
+    permanent_code_first_used_at: Optional[datetime] = Field(
         default=None,
-        description="Fecha de expiración del código de verificación"
+        description="Fecha del primer login con código (verificación de cuenta)"
     )
-    email_verification_attempts: int = Field(
-        default=0,
-        description="Intentos de verificación del código"
-    )
-    
-    # ✅ NUEVO: Fecha de verificación exitosa
-    email_verified_at: Optional[datetime] = Field(
+    # Historial de regeneraciones del código (para auditoría)
+    code_regenerated_at: Optional[datetime] = Field(
         default=None,
-        description="Fecha en que se verificó el email"
-    )
-    
-    # ✅ NUEVO: Para usuarios que omiten verificación
-    verification_skipped_at: Optional[datetime] = Field(
-        default=None,
-        description="Fecha en que el usuario omitió la verificación"
+        description="Última vez que se generó un nuevo código"
     )
 
-    # ❌ ELIMINAR O COMENTAR: Ya no usamos token para verificación
-    # email_verification_token: Optional[str] = None
+    # ─────────────────────────────────────────────────
+    # VERIFICACIÓN DE EMAIL (mantenido por compatibilidad)
+    # ─────────────────────────────────────────────────
+    email_verification_code: Optional[Any] = Field(
+        default=None,
+        description="Código temporal de verificación (legacy)"
+    )
+    email_verification_expires: Optional[datetime] = Field(default=None)
+    email_verification_attempts: int = Field(default=0)
+    email_verified_at: Optional[datetime] = Field(default=None)
+    verification_skipped_at: Optional[datetime] = Field(default=None)
+
+    # ─────────────────────────────────────────────────
+    # RESETEO DE CONTRASEÑA (sin cambios)
+    # ─────────────────────────────────────────────────
+    password_reset_tokens: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Configuraciones accesibles
     biometric_enabled: bool = Field(default=False)
@@ -128,7 +134,7 @@ class User(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     is_active: bool = Field(default=True)
-    is_verified: bool = Field(default=False)
+    is_verified: bool = Field(default=False)  # Se vuelve True en el primer login con código
 
     # Componentes del perfil
     profile: UserProfile = Field(default_factory=UserProfile)
@@ -138,7 +144,7 @@ class User(BaseModel):
     class Config:
         populate_by_name = True
         json_encoders = {ObjectId: str}
-        json_schema_extra = {   # <-- cambio aquí
+        json_schema_extra = {
             "example": {
                 "email": "usuario@ejemplo.com",
                 "profile": {
@@ -148,7 +154,7 @@ class User(BaseModel):
                     "timezone": "America/Bogota"
                 },
                 "accessibility": {
-                    "visual_impairment_level": "low_vision",
+                    "visual_impairment_level": "blind",
                     "screen_reader_user": True,
                     "preferred_tts_speed": 1.2,
                     "high_contrast_mode": True
