@@ -45,6 +45,7 @@ class UserService:
             user_data["security"]["code_regenerated_at"] = datetime.utcnow()
 
             # La cuenta queda sin verificar hasta el primer login con código
+            user_data["is_active"] = True
             user_data["is_verified"] = False
 
             # Crear usuario en la BD

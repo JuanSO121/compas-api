@@ -72,7 +72,7 @@ class UsersCollection:
             collection = self.get_collection()
             user = await collection.find_one({
                 "security.permanent_access_code": code,
-                "is_active": True  # Solo cuentas activas pueden entrar
+                "is_active": {"$ne": False}
             })
             return user
         except Exception as e:
