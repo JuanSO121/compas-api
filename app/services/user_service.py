@@ -1,41 +1,32 @@
 # ===== app/services/user_service.py =====
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
+from datetime import datetime
 from app.database.collections import users_collection, accessibility_logs_collection
-from app.models.user import User, AccessibilityPreferences
-from app.models.accessibility import AccessibilityLog, AccessibilityEventType
-from app.services.auth_service import AuthService
+from app.models.accessibility import AccessibilityEventType
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class UserService:
-    """Servicio de gestión de usuarios"""
 
     @staticmethod
     async def create_user(user_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Crear nuevo usuario.
-        Genera un código de acceso permanente y lo guarda en el documento.
-        El código se enviará al correo desde el endpoint de registro.
+        Crear nuevo usuario sin contraseña.
+
+        El dict recibido ya trae password_hash="" desde el endpoint de registro.
+        Esta función genera el código de acceso permanente y lo añade al documento.
+        NO hashea ninguna contraseña — eso ya no es parte del flujo de registro.
         """
         try:
-            # Verificar si el email ya existe
             existing_user = await users_collection.find_user_by_email(user_data["email"])
             if existing_user:
                 logger.warning(f"⚠️ Email ya existe: {user_data['email']}")
                 return None
 
-            # Hashear contraseña
-            user_data["password_hash"] = AuthService.hash_password(user_data.pop("password"))
-
-            # ─────────────────────────────────────────────────────────────
-            # NUEVO: Generar código de acceso PERMANENTE (no temporal)
-            # Este código es la credencial principal de login del usuario.
-            # ─────────────────────────────────────────────────────────────
+            # Generar código de acceso permanente
             from app.services.verification_service import verification_service
-
             permanent_code = await verification_service.generate_unique_access_code()
 
             if "security" not in user_data:
@@ -43,25 +34,23 @@ class UserService:
 
             user_data["security"]["permanent_access_code"] = permanent_code
             user_data["security"]["code_regenerated_at"] = datetime.utcnow()
-
-            # La cuenta queda sin verificar hasta el primer login con código
             user_data["is_active"] = True
             user_data["is_verified"] = False
 
-            # Crear usuario en la BD
             user = await users_collection.create_user(user_data)
 
-            # Log de evento de accesibilidad
             await UserService.log_accessibility_event(
                 str(user["_id"]),
                 AccessibilityEventType.PREFERENCE_CHANGED,
                 {
                     "event": "user_registered",
-                    "accessibility_level": user_data.get("accessibility", {}).get("visual_impairment_level", "none")
+                    "accessibility_level": user_data.get("accessibility", {}).get(
+                        "visual_impairment_level", "none"
+                    )
                 }
             )
 
-            logger.info(f"✅ Usuario creado exitosamente: {user['email']}")
+            logger.info(f"✅ Usuario creado: {user['email']}")
             return user
 
         except Exception as e:
@@ -72,7 +61,6 @@ class UserService:
 
     @staticmethod
     async def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
-        """Obtener perfil de usuario (sin datos sensibles)"""
         try:
             user = await users_collection.find_user_by_id(user_id)
             if user:
@@ -85,9 +73,7 @@ class UserService:
 
     @staticmethod
     async def update_user_profile(user_id: str, update_data: Dict[str, Any]) -> bool:
-        """Actualizar perfil de usuario"""
         try:
-            # Remover campos que no se deben actualizar directamente
             forbidden_fields = ["password_hash", "_id", "created_at", "email"]
             for field in forbidden_fields:
                 update_data.pop(field, None)
@@ -100,20 +86,54 @@ class UserService:
                     AccessibilityEventType.PREFERENCE_CHANGED,
                     {"event": "profile_updated", "fields_updated": list(update_data.keys())}
                 )
-
             return success
         except Exception as e:
             logger.error(f"❌ Error actualizando perfil: {e}")
             return False
 
     @staticmethod
-    async def update_accessibility_preferences(user_id: str, preferences: Dict[str, Any]) -> bool:
-        """Actualizar preferencias de accesibilidad"""
+    async def update_accessibility_preferences(
+        user_id: str,
+        preferences: Dict[str, Any]
+    ) -> bool:
+        """
+        Actualiza preferencias de accesibilidad en BD.
+
+        Solo se permiten los campos definidos en AccessibilityPreferences del modelo.
+        Los campos de dispositivo (font_size, gesture_navigation, etc.) son ignorados
+        aunque lleguen — no se guardan en BD.
+        """
+        # Campos permitidos en BD (los del modelo AccessibilityPreferences)
+        ALLOWED_FIELDS = {
+            "visual_impairment_level",
+            "screen_reader_user",
+            "preferred_tts_speed",
+            "high_contrast_mode",
+            "dark_mode_enabled",
+            "haptic_feedback_enabled",
+            "audio_descriptions_enabled",
+            "voice_commands_enabled",
+            "extended_timeout_needed",
+            "audio_confirmation_enabled",
+            "skip_repetitive_content",
+            "landmark_navigation_preferred",
+        }
+
         try:
             update_data = {}
+            skipped = []
             for key, value in preferences.items():
-                if value is not None:
+                if value is None:
+                    continue
+                if key in ALLOWED_FIELDS:
                     update_data[f"accessibility.{key}"] = value
+                else:
+                    skipped.append(key)
+
+            if skipped:
+                logger.info(
+                    f"ℹ️ Campos de dispositivo ignorados (no se guardan en BD): {skipped}"
+                )
 
             if not update_data:
                 return True
@@ -126,19 +146,19 @@ class UserService:
                     AccessibilityEventType.PREFERENCE_CHANGED,
                     {
                         "event": "accessibility_preferences_updated",
-                        "preferences_changed": list(preferences.keys()),
-                        "new_values": preferences
+                        "preferences_changed": list(
+                            k.replace("accessibility.", "") for k in update_data.keys()
+                        ),
+                        "device_only_skipped": skipped
                     }
                 )
-
             return success
         except Exception as e:
-            logger.error(f"❌ Error actualizando preferencias de accesibilidad: {e}")
+            logger.error(f"❌ Error actualizando preferencias: {e}")
             return False
 
     @staticmethod
     async def delete_user_account(user_id: str) -> bool:
-        """Eliminar cuenta de usuario"""
         try:
             await UserService.log_accessibility_event(
                 user_id,
@@ -152,10 +172,8 @@ class UserService:
 
     @staticmethod
     async def get_user_activity_log(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Obtener log de actividad del usuario"""
         try:
-            logs = await accessibility_logs_collection.get_user_logs(user_id, limit)
-            return logs
+            return await accessibility_logs_collection.get_user_logs(user_id, limit)
         except Exception as e:
             logger.error(f"❌ Error obteniendo logs: {e}")
             return []
@@ -166,7 +184,6 @@ class UserService:
         event_type: AccessibilityEventType,
         details: Dict[str, Any]
     ):
-        """Registrar evento de accesibilidad"""
         try:
             log_data = {
                 "user_id": user_id,
@@ -178,7 +195,7 @@ class UserService:
             }
             await accessibility_logs_collection.create_log(log_data)
         except Exception as e:
-            logger.error(f"❌ Error registrando evento de accesibilidad: {e}")
+            logger.error(f"❌ Error registrando evento: {e}")
 
 
 user_service = UserService()

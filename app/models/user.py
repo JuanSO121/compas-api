@@ -30,35 +30,89 @@ class PyObjectId(ObjectId):
 
 
 class AccessibilityPreferences(BaseModel):
-    """Preferencias de accesibilidad del usuario"""
-    visual_impairment_level: str = Field(default="none", pattern="^(blind|low_vision|none)$")
-    screen_reader_user: bool = Field(default=False)
-    preferred_tts_speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    preferred_font_size: str = Field(default="medium", pattern="^(small|medium|large|x-large)$")
-    high_contrast_mode: bool = Field(default=False)
-    dark_mode_enabled: bool = Field(default=False)
+    """
+    Preferencias de accesibilidad del usuario.
 
-    # Preferencias de interacción
-    haptic_feedback_enabled: bool = Field(default=True)
-    audio_descriptions_enabled: bool = Field(default=False)
-    voice_commands_enabled: bool = Field(default=False)
-    gesture_navigation_enabled: bool = Field(default=True)
+    NOTA SOBRE QUÉ SE PERSISTE EN BD:
+    - Los campos aquí definidos se guardan en MongoDB y se restauran
+      al iniciar sesión desde cualquier dispositivo.
+    - Preferencias de UI puras que dependen del dispositivo (tamaño de
+      pantalla, brillo, etc.) NO deben guardarse aquí — esas van en
+      SharedPreferences / almacenamiento local del dispositivo.
+    - Los campos marcados como "interno app" son leídos por el backend
+      para lógica de negocio (rate limiting, timeouts) pero también
+      se envían al cliente para que la app configure su comportamiento.
+    """
 
-    # Configuraciones de tiempo
-    extended_timeout_needed: bool = Field(default=False)
-    slow_animations: bool = Field(default=False)
+    # ── Accesibilidad visual — persiste en BD ─────────────────────────────────
+    visual_impairment_level: str = Field(
+        default="none",
+        pattern="^(blind|low_vision|none)$",
+        description="Nivel de discapacidad visual. Afecta rate limiting y timeouts del backend."
+    )
+    screen_reader_user: bool = Field(
+        default=False,
+        description="Indica si usa lector de pantalla. Usado por backend para mensajes TTS."
+    )
+    preferred_tts_speed: float = Field(
+        default=1.0, ge=0.5, le=2.0,
+        description="Velocidad preferida de síntesis de voz. Persiste entre dispositivos."
+    )
+    high_contrast_mode: bool = Field(
+        default=False,
+        description="Modo de alto contraste. Persiste entre dispositivos."
+    )
+    dark_mode_enabled: bool = Field(
+        default=False,
+        description="Modo oscuro. Persiste entre dispositivos."
+    )
 
-    # Sonidos y audio
-    custom_notification_sounds: bool = Field(default=False)
-    audio_confirmation_enabled: bool = Field(default=True)
+    # ── Interacción — persiste en BD ──────────────────────────────────────────
+    haptic_feedback_enabled: bool = Field(
+        default=True,
+        description="Retroalimentación háptica. Persiste entre dispositivos."
+    )
+    audio_descriptions_enabled: bool = Field(
+        default=False,
+        description="Descripciones de audio para contenido visual. Persiste en BD."
+    )
+    voice_commands_enabled: bool = Field(
+        default=False,
+        description="Comandos de voz habilitados. Persiste en BD."
+    )
+    extended_timeout_needed: bool = Field(
+        default=False,
+        description=(
+            "El usuario necesita más tiempo para interacciones. "
+            "Usado por backend para extender rate limiting y timeouts de sesión."
+        )
+    )
+    audio_confirmation_enabled: bool = Field(
+        default=True,
+        description="Confirmaciones de audio en acciones. Persiste en BD."
+    )
 
-    # Navegación
-    skip_repetitive_content: bool = Field(default=True)
-    landmark_navigation_preferred: bool = Field(default=True)
+    # ── Navegación — persiste en BD ───────────────────────────────────────────
+    skip_repetitive_content: bool = Field(
+        default=True,
+        description="Saltar contenido repetitivo (para lectores de pantalla)."
+    )
+    landmark_navigation_preferred: bool = Field(
+        default=True,
+        description="Preferencia de navegación por landmarks de accesibilidad."
+    )
+
+    # ── Campos que NO se guardan en BD (manejados localmente en el dispositivo):
+    # - preferred_font_size  → depende de la pantalla del dispositivo
+    # - gesture_navigation_enabled → depende del OS y configuración del dispositivo
+    # - slow_animations → depende de la configuración de accesibilidad del OS
+    # - custom_notification_sounds → depende de los permisos del dispositivo
+    # Estos campos se removieron del modelo de BD intencionalmente.
+    # La app los maneja con SharedPreferences y los lee del sistema operativo.
 
 
 class UserProfile(BaseModel):
-    """Perfil básico del usuario"""
+    """Perfil básico del usuario — todo persiste en BD"""
     first_name: Optional[str] = Field(None, min_length=1, max_length=50)
     last_name: Optional[str] = Field(None, min_length=1, max_length=50)
     phone: Optional[str] = Field(None, pattern=r'^\+?[1-9]\d{1,14}$')
@@ -75,68 +129,65 @@ class SecurityQuestion(BaseModel):
 
 class UserSecurity(BaseModel):
     """Configuraciones de seguridad del usuario"""
-    login_attempts: int = Field(default=0)
     last_login: Optional[datetime] = None
     failed_login_attempts: int = Field(default=0)
     account_locked_until: Optional[datetime] = None
 
-    # ─────────────────────────────────────────────────
-    # CÓDIGO DE ACCESO PERMANENTE (LOGIN PRINCIPAL)
-    # ─────────────────────────────────────────────────
-    # Este código se genera al registrarse y se envía al correo.
-    # Es la única credencial necesaria para iniciar sesión.
-    # Se puede regenerar usando email + contraseña (recuperación).
+    # ── Código de acceso permanente (login principal) ─────────────────────────
     permanent_access_code: Optional[str] = Field(
         default=None,
         min_length=6,
         max_length=8,
         description="Código permanente de acceso para login sin contraseña"
     )
-    # Fecha en que se usó el código por primera vez (= verificación de cuenta)
     permanent_code_first_used_at: Optional[datetime] = Field(
         default=None,
-        description="Fecha del primer login con código (verificación de cuenta)"
+        description="Fecha del primer login con código (= verificación de cuenta)"
     )
-    # Historial de regeneraciones del código (para auditoría)
     code_regenerated_at: Optional[datetime] = Field(
         default=None,
         description="Última vez que se generó un nuevo código"
     )
 
-    # ─────────────────────────────────────────────────
-    # VERIFICACIÓN DE EMAIL (mantenido por compatibilidad)
-    # ─────────────────────────────────────────────────
-    email_verification_code: Optional[Any] = Field(
-        default=None,
-        description="Código temporal de verificación (legacy)"
-    )
+    # ── Verificación de email (campos legacy — se mantienen para compatibilidad) ──
+    email_verification_code: Optional[Any] = Field(default=None)
     email_verification_expires: Optional[datetime] = Field(default=None)
     email_verification_attempts: int = Field(default=0)
     email_verified_at: Optional[datetime] = Field(default=None)
     verification_skipped_at: Optional[datetime] = Field(default=None)
 
-    # ─────────────────────────────────────────────────
-    # RESETEO DE CONTRASEÑA (sin cambios)
-    # ─────────────────────────────────────────────────
+    # ── Reseteo de contraseña (legacy — para usuarios con password_hash) ──────
     password_reset_tokens: List[Dict[str, Any]] = Field(default_factory=list)
 
-    # Configuraciones accesibles
+    # ── Biometría y 2FA ───────────────────────────────────────────────────────
     biometric_enabled: bool = Field(default=False)
     two_factor_method: str = Field(default="none", pattern="^(none|email|sms)$")
     security_questions: List[SecurityQuestion] = Field(default_factory=list, max_items=3)
 
 
 class User(BaseModel):
-    """Modelo de usuario"""
+    """
+    Modelo de usuario.
+
+    password_hash es opcional porque los nuevos usuarios se registran
+    sin contraseña. Los usuarios legacy (registrados antes del cambio)
+    mantienen su hash — esto permite que el login secundario
+    email+contraseña siga funcionando para ellos.
+    """
     id: Optional[PyObjectId] = Field(alias="_id", default=None)
     email: EmailStr = Field(..., description="Email único del usuario")
-    password_hash: str = Field(..., min_length=1)
+
+    # Opcional: vacío ("") en usuarios nuevos, hash real en usuarios legacy.
+    password_hash: str = Field(
+        default="",
+        description="Hash bcrypt. Vacío en usuarios sin contraseña."
+    )
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     is_active: bool = Field(default=True)
-    is_verified: bool = Field(default=False)  # Se vuelve True en el primer login con código
+    is_verified: bool = Field(default=False)
 
-    # Componentes del perfil
     profile: UserProfile = Field(default_factory=UserProfile)
     accessibility: AccessibilityPreferences = Field(default_factory=AccessibilityPreferences)
     security: UserSecurity = Field(default_factory=UserSecurity)
