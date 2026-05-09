@@ -330,12 +330,11 @@ async def login_with_code(login_data: CodeLogin, request: Request):
 async def request_new_code(data: RequestNewCode, request: Request):
     """
     Solicitar un nuevo código de acceso permanente.
-    Se usa cuando el usuario perdió u olvidó su código.
-    Requiere email + contraseña para verificar la identidad.
-    El nuevo código se envía al email y el anterior deja de funcionar.
+    Solo requiere el email. Siempre responde igual para evitar
+    enumeración de usuarios.
     """
     try:
-        # Validar email
+        # Validar formato de email
         email_validation = AccessibleValidators.validate_email_accessible(data.email)
         if not email_validation["valid"]:
             return AccessibleHelpers.create_accessible_response(
@@ -353,54 +352,30 @@ async def request_new_code(data: RequestNewCode, request: Request):
                 }
             )
 
-        # Autenticar con email + contraseña
-        user = await auth_service.authenticate_user(data.email, data.password)
-        if not user:
-            return AccessibleHelpers.create_accessible_response(
-                success=False,
-                message="Email o contraseña incorrectos.",
-                errors=[AccessibleHelpers.create_accessible_error(
-                    message="Credenciales inválidas",
-                    field="password",
-                    suggestion="Verifique su email y contraseña"
-                )],
-                accessibility_info={
-                    "announcement": "Email o contraseña incorrectos. Verifique sus datos.",
-                    "focus_element": "password-field",
-                    "haptic_pattern": "error"
-                }
-            )
-
-        # Generar y enviar nuevo código permanente
+        # Buscar usuario y enviar código — respuesta genérica siempre
         from app.services.verification_service import verification_service
-        user_name = user.get("profile", {}).get("first_name", "")
-
-        email_sent = await verification_service.send_new_code_by_email(
-            email=user["email"],
-            user_name=user_name
+        user = await users_collection.find_user_by_email(
+            email_validation["normalized_email"]
         )
 
-        if not email_sent:
-            return AccessibleHelpers.create_accessible_response(
-                success=False,
-                message="Error enviando el nuevo código. Intente nuevamente.",
-                accessibility_info={
-                    "announcement": "Error enviando código. Intente nuevamente en unos momentos.",
-                    "haptic_pattern": "error"
-                }
+        if user and user.get("is_active", True):
+            user_name = user.get("profile", {}).get("first_name", "")
+            await verification_service.send_new_code_by_email(
+                email=user["email"],
+                user_name=user_name
             )
+            # No verificamos el resultado — la respuesta al cliente es siempre la misma
 
         return AccessibleHelpers.create_accessible_response(
             success=True,
             message=(
-                "Nuevo código enviado a su email. "
-                "Revise su bandeja de entrada. "
-                "El código anterior ya no funciona."
+                "Si el email está registrado, recibirá su código de acceso en unos momentos. "
+                "Revise también la carpeta de spam."
             ),
             accessibility_info={
                 "announcement": (
-                    "Nuevo código de acceso enviado a su correo electrónico. "
-                    "Revise su bandeja de entrada. Recuerde que el código anterior ya no sirve."
+                    "Si el email está registrado, recibirá su código en unos momentos. "
+                    "Revise su bandeja de entrada y la carpeta de spam."
                 ),
                 "focus_element": "success-message",
                 "haptic_pattern": "success"
@@ -409,8 +384,6 @@ async def request_new_code(data: RequestNewCode, request: Request):
 
     except Exception as e:
         logger.error(f"❌ Error solicitando nuevo código: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return AccessibleHelpers.create_accessible_response(
             success=False,
             message="Error interno del servidor",

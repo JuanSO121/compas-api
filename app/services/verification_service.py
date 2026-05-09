@@ -94,25 +94,30 @@ class VerificationService:
     @staticmethod
     async def send_new_code_by_email(email: str, user_name: str = "") -> bool:
         """
-        Generar nuevo código permanente para un usuario y enviarlo por email.
-        Se usa en el endpoint de recuperación /request-new-code.
+        Reenviar el código permanente al correo del usuario.
+        No requiere contraseña — solo que el email exista en el sistema.
+        Por seguridad, siempre responde True aunque el email no exista
+        (evita enumeración de usuarios).
         """
         try:
             user = await users_collection.find_user_by_email(email)
             if not user:
-                return False
+                # No revelar si el email existe o no
+                logger.warning(f"⚠️ Intento de reenvío de código para email no registrado")
+                return True  # ← respuesta genérica para evitar user enumeration
 
-            # Generar y guardar nuevo código
             new_code = await VerificationService.assign_permanent_code_to_user(str(user["_id"]))
             if not new_code:
                 return False
 
-            # Enviar email con el nuevo código permanente
+            profile = user.get("profile", {})
+            user_name = user_name or profile.get("first_name", "")
+
             return await email_service.send_permanent_access_code_email(
                 email=email,
                 code=new_code,
                 user_name=user_name,
-                is_regenerated=True  # indica que es un código nuevo (no el primero)
+                is_regenerated=True
             )
 
         except Exception as e:

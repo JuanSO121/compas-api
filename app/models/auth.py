@@ -79,12 +79,10 @@ class CodeLogin(BaseModel):
 
 class RequestNewCode(BaseModel):
     """
-    Solicitar un nuevo código de acceso.
-    Se usa cuando el usuario olvidó o perdió su código.
-    Requiere email + contraseña para verificar identidad.
+    Solicitar que se reenvíe el código de acceso al correo.
+    Solo requiere el email registrado — sin contraseña.
     """
     email: EmailStr = Field(..., description="Email registrado en la cuenta")
-    password: str = Field(..., min_length=1, description="Contraseña para verificar identidad")
 
 
 # ───────────────────────────────────────────────
